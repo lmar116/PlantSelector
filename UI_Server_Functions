@@ -1,0 +1,882 @@
+#Import our libraries
+library(shiny)
+library(tidyverse)
+library(shinythemes)
+library(shinydashboard)
+library(plyr)
+
+#Matrices
+ULB <-
+  read.csv("./data/ULB_mat.csv",
+           row.names = 1)
+NATAG <-
+  read.csv("./data/NATAG_mat.csv",
+           row.names = 1)
+
+#functions####
+#source("./data/PSFunctions.R")
+## pollinator abundance function
+abundance.ulb <- function(m) sum(rowSums(ULB[,m]))
+abundance.natag <- function(m) sum(rowSums(NATAG[,m]))
+abundance.user <- function(m) sum(rowSums(USERdf[,m]))
+
+## pollinator richness function
+richness.ulb <- function(m) sum(rowSums(ULB[,m]>0)>0)
+richness.natag <- function(m) sum(rowSums(NATAG[,m]>0)>0)
+richness.user <- function(m) sum(rowSums(USERdf[,m]>0)>0)
+
+## combination functions
+abundance.ulb.richness.ulb <- function(m)
+  abundance.ulb(m)*richness.ulb(m)
+abundance.natag.richness.natag <- function(m)
+  abundance.natag(m)*richness.natag(m)
+abundance.user.richness.user <- function(m) 
+  abundance.user(m)*richness.user(m)
+
+## Xtree function for the calculation of FD
+## 17/1/03. Written by Jens Schumacher
+
+Xtree <- function(h)
+  ## evaluate species branch matrix (sensu Petchey & Gaston 2002) from a dendrogram
+  ## The object returned by Xtree() is a list containing a species by branch matrix (H1) and a branch length
+  ## vector (h2)
+  ## see http://onlinelibrary.wiley.com/doi/10.1046/j.1461-0248.2002.00339.x/abstract
+  
+  ## tested for results of hclust and agnes
+  ## hclust - hierarchical clustering
+  ## agnes - agglomerative clustering
+  
+  ## used components:
+  ## merge - history of cluster merging
+## height - actual heights at merging
+## order - permutation to achieve nice output (needed only for agnes)
+{
+  
+  species.names <- h$labels
+  
+  
+  H1 <- matrix(0, length(h$order), 2 * length(h$order) - 2)
+  l <- vector("numeric", 2 * length(h$order) - 2)
+  for(i in 1:(length(h$order) - 1)) {
+    # evaluate branch lengths
+    #
+    if(h$merge[i, 1] < 0) {
+      l[2 * i - 1] <- h$height[order(h$height)[i]]
+      H1[ - h$merge[i, 1], 2 * i - 1] <- 1
+    }
+    else {
+      l[2 * i - 1] <- h$height[order(h$height)[i]] - h$height[order(h$height)[h$merge[i, 1]]]
+      H1[, 2 * i - 1] <- H1[, 2 * h$merge[i, 1] - 1] + H1[
+        , 2 * h$merge[i, 1]]
+    }
+    if(h$merge[i, 2] < 0) {
+      l[2 * i] <- h$height[order(h$height)[i]]
+      H1[ - h$merge[i, 2], 2 * i] <- 1
+    }
+    else {
+      l[2 * i] <- h$height[order(h$height)[i]] - h$height[order(h$height)[h$merge[i, 2]]]
+      H1[, 2 * i] <- H1[, 2 * h$merge[i, 2] - 1] + H1[, 2 *
+                                                        h$merge[i, 2]]
+    }
+  }
+  dimnames(H1) <- list(species.names,NULL)
+  list(h2.prime=l, H1=H1)
+  ## l contains the length of all the tiny branches
+  ## H1: each row represents one species, each column represents one branch
+  ##     1 indicates that a branch is part of the pathway from species to top of the dendrogram
+  ##     0 otherwise
+}
+
+
+## compute score for model m
+score <- function(f.list, m) {
+  g <- function(f.list, m) sapply(f.list, function(y) y(m))
+  prod(g(f.list, m))
+}
+
+#### (5) Step the population through one full generation:
+ga.step <- function(state, s, p.mutate, p.sex, p.rec, fitness) {
+  ## Mutation
+  state.m <- update.state(state, mutate(state=state,
+                                        p.mutate=p.mutate,
+                                        fitness=fitness))
+  
+  ## Selection
+  state.s <- update.state(state, select(state=state.m, s=s))
+  
+  ## Recombination
+  state.r <- update.state(state, recombine(state=state.s,
+                                           popn0=state$popn,
+                                           p.sex=p.sex, p.rec=p.rec,
+                                           fitness=fitness))
+  state.r
+}
+
+## Bookkeeping to make sure that we keep the best model
+update.state <- function(s0, s1) {
+  if ( max(s1$w) > s0$best.w ) {
+    s1$best.w     <- max(s1$w)
+    s1$best.model <- s1$popn[[which.max(s1$w)]]
+  } else {
+    s1$best.w     <- s0$best.w
+    s1$best.model <- s0$best.model
+  }
+  s1
+}
+
+## Run the GA for ngens generations, collecting the best fitness over
+## time, and returning the state and best model.
+run.ga <- function(n.plants,
+                   n.plants.tot,
+                   N,
+                   n.gens,
+                   s,
+                   p.mutate,
+                   p.sex,
+                   p.rec,
+                   fitness) {
+  x <- initial.popn(N, n.plants, n.plants.tot,
+                    fitness=fitness)
+  out <- vector("numeric", n.gens)
+  for ( i in seq_len(n.gens) ){
+    x <- ga.step(x, s, p.mutate, p.sex, p.rec, fitness)
+    out[i] <- x$best.w
+  }
+  list(best.w=x$best.w, best.model=x$best.model, best.w.t=out)
+}
+
+## run the GA with default values
+find.mix.ulb <- function(f=f,
+                         k=k,
+                         N=100,
+                         n.gens=1000,
+                         s=5,
+                         p.mutate=0.01,
+                         p.sex=0.5,
+                         p.rec=0.25,
+                         fitness=f) {
+  res <- run.ga(n.plants=k,
+                n.plants.tot=ncol(ULB),
+                N=N,
+                n.gens=n.gens,
+                s=s,
+                p.mutate=p.mutate,
+                p.sex=p.sex,
+                p.rec=p.rec,
+                fitness=f)
+  colnames(ULB)[which(res$best.model)]
+}
+
+
+find.mix.natag <- function(f=f,
+                           k=k,
+                           N=100,
+                           n.gens=1000,
+                           s=5,
+                           p.mutate=0.01,
+                           p.sex=0.5,
+                           p.rec=0.25,
+                           fitness=f) {
+  res <- run.ga(n.plants=k,
+                n.plants.tot=ncol(NATAG),
+                N=N,
+                n.gens=n.gens,
+                s=s,
+                p.mutate=p.mutate,
+                p.sex=p.sex,
+                p.rec=p.rec,
+                fitness=f)
+  colnames(NATAG)[which(res$best.model)]
+}
+
+find.mix.user <- function(f=f,
+                          k=k,
+                          N=100,
+                          n.gens=1000,
+                          s=5,
+                          p.mutate=0.01,
+                          p.sex=0.5,
+                          p.rec=0.25,
+                          fitness=f) {
+  res <- run.ga(n.plants=k,
+                n.plants.tot=ncol(USERdf),
+                N=N,
+                n.gens=n.gens,
+                s=s,
+                p.mutate=p.mutate,
+                p.sex=p.sex,
+                p.rec=p.rec,
+                fitness=f)
+  colnames(USERdf)[which(res$best.model)]
+}
+
+#### (1) Initial state:
+## initial.popn randomly generates N solutions for n.plants.
+initial.popn <- function(N, n.plants, n.plants.tot, fitness) {
+  make.model <- function(x) {
+    m <- rep(FALSE, n.plants.tot)
+    m[sample(n.plants.tot, n.plants)] <- TRUE
+    m
+  }
+  
+  popn <- lapply(seq_len(N), make.model)
+  w <- sapply(popn, fitness)
+  list(popn=popn,
+       w=w,
+       best.w=max(w),
+       best.model=popn[[which.max(w)]])
+}
+
+#### (2) Mutation
+## Next, take a population 'popn', with a fitness vector 'w' (where
+## the ith element in 'w' gives the fitness of the ith model in
+## 'popn').
+##
+## First, draw binomial random deviates to determine how many
+## mutations will happen per model (mutations happen with probability
+## 'p.mutate', and there are 'n.plants' available for mutation).
+##
+## Mutate the models that had at least one mutation, by passing them
+## through to 'mutate'.
+##
+## Only mutated models need their fitness recalculated.
+##
+## Finally, return a list with the new population of models and their
+## fitness vector.
+mutate <- function(state, p.mutate, fitness) {
+  
+  popn <- state$popn
+  w <- state$w
+  nmutants <- rbinom(length(popn), length(popn[[1]]), p.mutate)
+  nmutants <- sapply(nmutants, function(x) min(sum(popn[[1]]), x))
+  mutated <- which(nmutants>0)
+  
+  if ( length(mutated) > 0 ) {
+    popn[mutated] <-
+      mapply(mutate.1, popn[mutated], nmutants[mutated],
+             SIMPLIFY=FALSE)
+    w[mutated] <- sapply(popn[mutated], fitness)
+  }
+  list(popn=popn,
+       w=w,
+       best.w=state$best.w,
+       best.model=state$best.model)
+}
+
+## Take a model 'x', specifying which 'n.plants', and mutate it.  To
+## do this (for a single mutant), randomly swap one included plant for
+## one not included (i.e. a model cannot, therefore, mutate to
+## itself).
+mutate.1 <- function(x, n.mutants) {
+  if(n.mutants > sum(x))
+    cat("Mutation rate too high. Too many mutants\n")
+  x1 <- sample(which(x), size=n.mutants)
+  x2 <- sample(which(!x), size=n.mutants)
+  x[x1] <- FALSE
+  x[x2] <- TRUE
+  x
+}
+
+#### (3) Selection:
+## This selection regime is fairly straightforward; sample with
+## replacement s*N models from the population, then take the N best
+## models.
+select <- function(state, s) {
+  N <- length(state$popn)
+  i <- sample(N, ceiling(s*N), TRUE)
+  take <- i[order(state$w[i], decreasing=TRUE)[1:N]]
+  list(popn=state$popn[take],
+       w=state$w[take],
+       best.w=state$best.w,
+       best.model=state$best.model)
+}
+
+#### DIFFERENT SELECTION ALGORITHM
+## select.weighted <- function(popn, w) {
+##   N <- length(popn)
+##   take <- sample(N, N, TRUE, w-min(w)+1)
+##   list(popn=popn[take], w=w[take])
+## }
+
+#### (4) Recombiation
+## Select a fraction of the population to be recombined.  These are
+## recombined with randomly selected individuals in the previous
+## generation (popn0).  The fitness of the recombinants is then
+## calculated.
+recombine <- function(state, popn0, p.sex, p.rec, fitness) {
+  popn1 <- state$popn
+  w1 <- state$w
+  N <- length(popn1)
+  nrec <- rbinom(1, N, p.sex)
+  i <- sample(N, nrec)
+  if ( length(i) > 0 ) {
+    b <- popn0[sample(N, nrec, TRUE)]
+    popn1[i] <- mapply(recombine.1, popn1[i], b, p=p.rec,
+                       SIMPLIFY=FALSE)
+    w1[i] <- sapply(popn1[i], fitness)
+  }
+  list(popn=popn1,
+       w=w1,
+       best.w=state$best.w,
+       best.model=state$best.model)
+}
+
+## recombination a pair of models:
+recombine.1 <- function(a, b, p) {
+  m.a <- which(a)
+  m.b <- which(b)
+  in.both <- intersect(m.a, m.b)
+  
+  m.a <- setdiff(m.a, in.both)
+  m.b <- setdiff(m.b, in.both)
+  
+  rr <- NULL
+  
+  if(length(m.a)>0) {
+    rec <- runif(length(m.a)) < p
+    if ( any(rec) ) {
+      parent <- c(cumsum(rec)%%2)+1
+      recombinant <- m.a
+      recombinant[parent==2] <- m.b[parent==2]
+      recombinant <- sort(c(recombinant, in.both))
+      a <- rep(FALSE, length(a))
+      a[recombinant] <- TRUE
+      a
+    }
+  }
+  a
+}
+
+
+#Define Tool####
+
+ui <- fluidPage(theme = shinytheme("darkly"),
+                tags$head(
+                  tags$style(
+                    "#ALPP{color: black;
+                                 font-size:20px;
+                                 font-style: italic;
+                                 }",
+                    "#PLPF{color: black;
+                                 font-size: 20px;
+                                 font-style: italic;
+                                 }",
+                    "#rep{color: black;
+                                 font-size: 20px;
+                                 font-style: italic;
+                                 }",
+                    HTML(
+                      "
+                    .item {
+                    font-style: italic;
+                    font-size: 20px;
+                    }
+                    .selectize-dropdown-content  {
+                    font-style: italic;
+                    font-size: 20px;
+                    }
+                    "
+                    )
+                  )
+                ),
+                
+                bootstrapPage(
+                  navbarPage(
+                    theme = bslib::bs_theme(
+                      # Controls the default grayscale palette
+                      bg = "#000",
+                      fg = "#ECECEC",
+                      # Controls the accent (e.g., hyperlink, button, etc) colors
+                      primary = "#138CCE",
+                      secondary = "#11BF2A",
+                      base_font = c("Grandstander", "sans-serif"),
+                      code_font = c("Courier", "monospace"),
+                      heading_font = "'Helvetica Neue', Helvetica, sans-serif",
+                      # Can also add lower-level customization
+                      "input-border-color" = "#138CCE"
+                    ),
+                    collapsible = FALSE,
+                    HTML(
+                      'Plant Selector'
+                    ),
+                    id = "nav",
+                    
+                    #### Optimal Plant Selection Tab ####
+                    tabPanel("Optimal Plant Selection",
+                             
+                             fluidRow(
+                               box(
+                                 title = "Parameters",
+                                 width = 4,
+                                 solidHeader = TRUE,
+                                 status = "primary",
+                                 radioButtons(
+                                   "data",
+                                   "Database",
+                                   choices = list(
+                                     "ULB (Academic Dataset) " = "ULB",
+                                     "NATAGORA (Citizen Science Dataset) " = "NATAG",
+                                     "User Uploaded Data " = "USER"
+                                   )
+                                 ),
+                                 helpText("Choose database for selection of optimal flowering plants"),
+                                 fileInput("file1", "Choose CSV File for User Data", accept = ".csv"),
+                                 helpText(
+                                   "file should be .csv matrix of counts of bee plant interactions with the first column the names of the bees and the top row the names of the plants."
+                                 ),
+                                 numericInput(
+                                   "k",
+                                   "Number of Plants",
+                                   min = 1,
+                                   max = 20,
+                                   value = 3
+                                 ),
+                                 numericInput(
+                                   "n.gen",
+                                   "Number of Iterations",
+                                   min = 10,
+                                   max = 10000,
+                                   value = 1000
+                                 ),
+                                 helpText("Select number of iterations (1000 recommended)"),
+                                 checkboxGroupInput(
+                                   "param",
+                                   "Selection Parameters",
+                                   choices = list("Abundance" = "abundance", "Species Richness" = "richness")
+                                 ),
+                                 helpText("Select parameters for calculation of optimal flowering plants"),
+                                 actionButton("start", "Search"),
+                                 helpText(
+                                   "Note: Tool may take some time to choose the optimal flowering plants"
+                                 )
+                               ),
+                               box(
+                                 title = "Optimal Plants",
+                                 solidHeader = TRUE,
+                                 status = "success",
+                                 verbatimTextOutput("rep")
+                               )
+                             )),
+                    
+                    
+                    #### Visualization per Species Tab ####
+                    tabPanel(
+                      "Visualization per Species",
+                      fluidRow(
+                        box(
+                          width = 4,
+                          status = "primary",
+                          radioData2 <- radioButtons(
+                            "data2",
+                            "Database",
+                            choices = list(
+                              "ULB (Academic Dataset) " = "ULB",
+                              "NATAGORA (Citizen Science Dataset) " = "NATAG",
+                              "User Uploaded Data " = "USER"
+                            )
+                          ),
+                          helpText("Choose database for selection"),
+                          fileInput("file2", "Choose CSV File", accept = ".csv"),
+                        )
+                      ),
+                      fluidRow(
+                        box(
+                          title = "Choose wild bee",
+                          width = 4,
+                          selectInput("bee_vis", "", choices = rownames(ULB))
+                        ),
+                        box(title = "Most frequently visited plant",
+                            verbatimTextOutput("PLPF")),
+                        plotOutput("BARPLPF", width = "70%"),
+                      ),
+                      hr(),
+                      fluidRow(
+                        box(
+                          title = "Choose flowering plant species",
+                          width = 4,
+                          selectInput("plant_vis", "", choices = colnames(ULB))
+                        ),
+                        box(title = "Most common wild bee visitor",
+                            verbatimTextOutput("ALPP")),
+                        plotOutput("BARALPP", width = "70%")
+                      )
+                    )
+                  ),
+                  
+                ))
+
+
+# Define server logic required to draw a histogram
+server <- function(input, output, session) {
+  DEBUG = TRUE
+  
+  #### Optimal Plant Selection Tab ####
+  
+  output$rep <- renderText({
+    input$start
+    
+    isolate({
+      inFile1 <<- input$file1
+      n.gens  <<- input$n.gen
+      
+      if (DEBUG) {
+        cat("Start render output \n")
+      }
+      if (!is.null(input$param)) {
+        # if vector not null
+        # Compute param k and f of find.mix function
+        k = input$k
+        f = ""
+        
+        if (input$k > 20) {
+          return("Error: too many plants selected, max = 20")
+        } else{
+          # Compute index
+          abundanceIdx = match('abundance', input$param)
+          richnessIdx = match('richness', input$param)
+          
+          # Concat string in right order to call find.mix function
+          if (!is.na(abundanceIdx)) {
+            if (input$data == "ULB") {
+              f = paste0(input$param[abundanceIdx], ".ulb")
+            } else if (input$data == "NATAG") {
+              f = paste0(input$param[abundanceIdx], ".natag")
+            } else if (input$data == "USER") {
+              if (is.null(inFile1))
+                return(NULL)
+              f = paste0(input$param[abundanceIdx], ".user")
+            }
+          }
+          if (!is.na(richnessIdx)) {
+            if (f != "") {
+              f = paste0(f, ".")
+            }
+            if (input$data == "ULB") {
+              f = paste0(f, input$param[richnessIdx], ".ulb")
+            } else if (input$data == "NATAG") {
+              f = paste0(f, input$param[richnessIdx], ".natag")
+            } else if (input$data == "USER") {
+              if (is.null(inFile1))
+                return(NULL)
+              f = paste0(f, input$param[richnessIdx], ".user")
+            }
+          }
+          
+          if (DEBUG) {
+            cat(paste(f, "\n"))
+          }
+          
+          if (DEBUG) {
+            cat(paste(input$start, "\n"))
+          }
+          
+          if (DEBUG) {
+            cat("Searching...\n")
+          }
+          
+          
+          # Call mix
+          if (input$data == "ULB") {
+            mix.rep <-
+              find.mix.ulb(f, k)
+            
+            # Display rep
+            mix.rep.N = ""
+            for (i in 1:input$k) {
+              mix.rep.N <- paste(mix.rep.N, mix.rep[i], "\n")
+            }
+            gsub("_", " ", mix.rep.N)
+          } else if (input$data == "NATAG") {
+            mix.rep <-
+              find.mix.natag(f, k)
+            
+            # Display rep
+            mix.rep.N = ""
+            for (i in 1:input$k) {
+              mix.rep.N <- paste(mix.rep.N, mix.rep[i], "\n")
+            }
+            
+            gsub("_", " ", mix.rep.N)
+          } else if (input$data == "USER") {
+            if (is.null(inFile1))
+              return(NULL)
+            USERdf <<-  read.csv(inFile1$datapath, row.names = 1)
+            if (input$k > (0.7 * ncol(USERdf))) {
+              #avoid model errors
+              return(
+                "Error: too many plant species selected, limited to 70% of database when fewer than 20 species"
+              )
+            } else{
+              mix.rep <-
+                find.mix.user(f, k)
+              
+              # Display rep
+              mix.rep.N = ""
+              for (i in 1:input$k) {
+                mix.rep.N <- paste(mix.rep.N, mix.rep[i], "\n")
+              }
+              
+              gsub("_", " ", mix.rep.N)
+            }
+          }
+        }
+      }
+    })
+  })
+  
+  
+  #### Visualization per Species Tab ####
+  
+  toListen <- reactive({
+    list(input$data2)
+  })
+  
+  observeEvent(toListen(), {
+    inFile <- input$file2
+    if (input$data2 == "ULB") {
+      updateSelectInput(session,
+                        input = "bee_vis",
+                        choices =  rownames(ULB))
+      updateSelectInput(session,
+                        input = "plant_vis",
+                        choices =  colnames(ULB))
+    } else if (input$data2 == "NATAG") {
+      updateSelectInput(session,
+                        input = "bee_vis",
+                        choices = rownames(NATAG))
+      updateSelectInput(session,
+                        input = "plant_vis",
+                        choices =  colnames(NATAG))
+    } else if (input$data2 == "USER") {
+      if (is.null(inFile))
+        return(NULL)
+      updateSelectInput(session,
+                        input = "bee_vis",
+                        choices = rownames(read.csv(inFile$datapath, row.names = 1)))
+      updateSelectInput(session,
+                        input = "plant_vis",
+                        choices =  colnames(read.csv(inFile$datapath, row.names = 1)))
+    }
+  })
+  
+  output$PLPF <- renderText({
+    inFile <- input$file2
+    if (input$data2 == "ULB") {
+      numRow <- which(rownames(ULB) %in% input$bee_vis)
+      gsub("\\..*", "", colnames(ULB[, apply(ULB, 1, which.max)])[numRow])
+    } else if (input$data2 == "NATAG") {
+      numRow <- which(rownames(NATAG) %in% input$bee_vis)
+      gsub("\\..*", "", colnames(NATAG[, apply(NATAG, 1, which.max)])[numRow])
+    } else{
+      if (is.null(inFile))
+        return(NULL)
+      numRow <-
+        which(rownames(read.csv(inFile$datapath, row.names = 1)) %in% input$bee_vis)
+      gsub("\\..*", "", colnames(read.csv(inFile$datapath, row.names = 1)[, apply(read.csv(inFile$datapath, row.names =
+                                                                                             1), 1, which.max)])[numRow])
+    }
+  })
+  
+  output$ALPP <- renderText({
+    inFile <- input$file2
+    
+    if (input$data2 == "ULB") {
+      numCol <- which(colnames(ULB) %in% input$plant_vis)
+      gsub("\\..*", "", rownames(ULB[apply(ULB, 2, which.max), ])[numCol])
+    } else if (input$data2 == "NATAG") {
+      numCol <- which(colnames(NATAG) %in% input$plant_vis)
+      gsub("\\..*", "", rownames(NATAG[apply(NATAG, 2, which.max), ])[numCol])
+    } else if (input$data2 == "USER") {
+      if (is.null(inFile))
+        return(NULL)
+      numCol <-
+        which(colnames(read.csv(inFile$datapath, row.names = 1)) %in% input$plant_vis)
+      gsub("\\..*", "", rownames(read.csv(inFile$datapath, row.names = 1)[apply(read.csv(inFile$datapath, row.names =
+                                                                                           1), 2, which.max), ])[numCol])
+    }
+  })
+  
+  output$BARPLPF <- renderPlot({
+    inFile <- input$file2
+    
+    if (input$data2 == "ULB") {
+      DF1 <- data.frame(Plant = colnames(ULB),
+                        Count = as.vector(t(ULB[which(rownames(ULB) %in% input$bee_vis),])))
+      if (sum(DF1$Count) == 0) {
+        plot.new()
+      } else{
+        DF <- DF1 %>% filter(Count > 0)
+        ggplot(DF, aes(x = Plant, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Visited flowering plants") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    } else if (input$data2 == "NATAG") {
+      DF1 <- data.frame(Plant = colnames(NATAG),
+                        Count = as.vector(t(NATAG[which(rownames(NATAG) %in% input$bee_vis),])))
+      if (sum(DF1$Count) == 0) {
+        plot.new()
+      } else{
+        DF <- DF1 %>% filter(Count > 0)
+        ggplot(DF, aes(x = Plant, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Visited flowering plants") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    } else if (input$data2 == "USER") {
+      if (is.null(inFile))
+        return(NULL)
+      DF1 <-
+        data.frame(Plant = colnames(read.csv(inFile$datapath, row.names = 1)),
+                   Count = as.vector(t(
+                     read.csv(inFile$datapath, row.names = 1)[which(rownames(read.csv(inFile$datapath, row.names =
+                                                                                        1)) %in% input$bee_vis),]
+                   )))
+      if (sum(DF1$Count) == 0) {
+        plot.new()
+      } else{
+        DF <- DF1 %>% filter(Count > 0)
+        ggplot(DF, aes(x = Plant, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Visited flowering plants") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    }
+    
+  })
+  
+  output$BARALPP <- renderPlot({
+    inFile <- input$file2
+    
+    if (input$data2 == "ULB") {
+      DF3 <- data.frame(WildBees = row.names(ULB),
+                        Count = ULB[, which(colnames(ULB) %in% input$plant_vis)])
+      if (sum(DF3$Count) == 0) {
+        plot.new()
+      } else{
+        DF2 <- DF3 %>% filter(Count > 0)
+        ggplot(DF2, aes(x = WildBees, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Wild bee visitors") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    } else if (input$data2 == "NATAG") {
+      DF3 <- data.frame(WildBees = row.names(NATAG),
+                        Count = NATAG[, which(colnames(NATAG) %in% input$plant_vis)])
+      if (sum(DF3$Count) == 0) {
+        plot.new()
+      } else{
+        DF2 <- DF3 %>% filter(Count > 0)
+        ggplot(DF2, aes(x = WildBees, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Wild bee visitors") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    } else if (input$data2 == "USER") {
+      if (is.null(inFile))
+        return(NULL)
+      DF3 <-
+        data.frame(
+          WildBees = row.names(read.csv(inFile$datapath, row.names = 1)),
+          Count = read.csv(inFile$datapath, row.names = 1)[, which(colnames(read.csv(inFile$datapath, row.names =
+                                                                                       1)) %in% input$plant_vis)]
+        )
+      if (sum(DF3$Count) == 0) {
+        plot.new()
+      } else{
+        DF2 <- DF3 %>% filter(Count > 0)
+        ggplot(DF2, aes(x = WildBees, y = Count)) + geom_bar(stat = "identity") +
+          theme_minimal() +
+          xlab("Wild bee visitors") + ylab("Number of recorded visits") +
+          theme(
+            axis.text.y = element_text(size = 14),
+            text = element_text(size = 16),
+            axis.text.x = element_text(
+              size = 14,
+              face = "italic",
+              angle = 90,
+              vjust = 0.5,
+              hjust = 1
+            )
+          ) +
+          scale_x_discrete(
+            labels = function(x)
+              gsub("_", " ", x, fixed = TRUE)
+          )
+      }
+    }
+  })
+}
+
+# Run the application
+shinyApp(ui = ui, server = server)
